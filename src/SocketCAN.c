@@ -62,7 +62,45 @@ void setFilterSocketCAN(int sockDesc, struct can_filter *rfilter, uint16_t rfilt
 	setsockopt(sockDesc, SOL_CAN_RAW, CAN_RAW_FILTER, &rfilter, sizeof(struct can_filter) * rfilter_size);
 }
 /////////////////////////////////////////////////////////////////////
-// Функция: принять сообщение по CAN
+// Функция: принять сообщение по CAN в неблокирующем режиме, используя poll
+int socketCANReceiveNotBlocking(int sockDesc, struct can_frame *CANframe, int mStimeout)
+{
+	// Настройка структуры pollfd
+	struct pollfd sockfds[1];
+	sockfds[0].fd = sockDesc;	// Сокет для мониторинга
+	sockfds[0].events = POLLIN; // Интересующее событие: данные для чтения
+	int RetPoll = 0;
+	RetPoll = poll(sockfds, 1, mStimeout);
+	if (RetPoll < 0)
+	{
+		perror("poll");
+		return SOCKET_CAN_ERROR;
+	}
+	else if (RetPoll == 0)
+	{
+		return SOCKET_CAN_NO_NEW_MSG;
+	}
+	else
+	{
+		if (sockfds[0].revents & POLLIN)
+		{
+			sockfds[0].revents = 0;
+			if (socketCANReceive(sockDesc, CANframe) == SOCKET_CAN_ERROR)
+			{
+				
+				perror("socketCANReceive failed");
+				return SOCKET_CAN_ERROR;
+			}
+			else
+			{
+				return SOCKET_CAN_NEW_MSG;
+			}
+		}
+	}
+	return SOCKET_CAN_ERROR;
+}
+/////////////////////////////////////////////////////////////////////
+// Функция: принять сообщение по CAN в блокирующем режиме
 int socketCANReceive(int sockDesc, struct can_frame *CANframe)
 {
 	if (read(sockDesc, CANframe, sizeof(struct can_frame)) < 0)

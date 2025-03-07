@@ -6,7 +6,7 @@
 int IntelHexParser(char *file_name, ExtractedFirmwareStruct *extractedData)
 {
 	char line[MAX_LINE_LENGTH] = {0};
-	FILE *file = fopen("stm32g474ret6.hex", "r");
+	FILE *file = fopen(file_name, "r");
 	if (file == NULL)
 	{
 		perror("Failed to open file");

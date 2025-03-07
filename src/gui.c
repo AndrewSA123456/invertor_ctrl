@@ -82,7 +82,7 @@ gpointer use_css()
 	gtk_style_context_add_provider_for_screen(screen, GTK_STYLE_PROVIDER(provider), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
 
 	GError *error = 0;
-	gtk_css_provider_load_from_file(provider, g_file_new_for_path("styles.css"), &error);
+	gtk_css_provider_load_from_file(provider, g_file_new_for_path("others/styles.css"), &error);
 	g_object_unref(provider);
 }
 ///////////////////////////////////////////////////////////////////////////////////////////////
@@ -171,7 +171,7 @@ gpointer open_firmware_chooser_window(GtkWidget *widget, gpointer data)
 		gtk_entry_set_text(GTK_ENTRY(data), firmware_file_name);
 		gtk_entry_set_width_chars(GTK_ENTRY(data), file_name_size);
 		gtk_widget_show_all(main_window_app);
-		g_async_queue_push(Background.Queue, create_task(TAST_PARSE_INTEL_HEX, 0, NULL));
+		g_async_queue_push(Background.Queue, create_task(TASK_PARSE_INTEL_HEX, 0, NULL));
 	}
 
 	gtk_widget_destroy(GTK_WIDGET(dialog));

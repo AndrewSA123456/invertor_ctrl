@@ -5,7 +5,10 @@
 enum
 {
 	SOCKET_CAN_ERROR = -1,
-	SOCKET_CAN_OK = 0
+	SOCKET_CAN_OK = 0,
+	SOCKET_CAN_NO_NEW_MSG = 1,
+	SOCKET_CAN_NEW_MSG = 2,
+
 };
 /////////////////////////////////////////////
 // Функция: открыть сокет CAN
@@ -20,8 +23,15 @@ void setFilterSocketCAN(int sockDesc,
 						uint16_t rfilter_size);
 /////////////////////////////////////////////
 // Функция: принять сообщение по CAN
+// в блокирующем режиме
 int socketCANReceive(int sockDesc,
-					 struct can_frame *CANframe);
+	struct can_frame *CANframe);
+/////////////////////////////////////////////
+// Функция: принять сообщение по CAN
+// в неблокирующем режиме, используя poll
+int socketCANReceiveNotBlocking(int sockDesc,
+			   struct can_frame *CANframe,
+			   int mStimeout);
 /////////////////////////////////////////////
 // Функция: передать сообщение по CAN
 int socketCANTransmit(int sockDesc,

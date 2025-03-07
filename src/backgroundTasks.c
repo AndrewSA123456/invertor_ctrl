@@ -4,6 +4,23 @@
 #include "SocketCAN.h"
 
 gint encryptFirmware(ExtractedFirmwareStruct *extractedData);
+int vectorsAddrTransmit(ExtractedFirmwareStruct *extractedData);
+int programAddrTransmit(ExtractedFirmwareStruct *extractedData);
+int rebootCMDTransmit();
+int programTransmit(ExtractedFirmwareStruct *extractedData);
+int programSegmentTransmitInit(ExtractedFirmwareStruct *extractedData);
+int programSegmentTransmit(uint8_t *buff, uint16_t typeMSG, uint32_t buff_size);
+int waitingSDOResponse(uint32_t nodeID);
+CANOpenMSGTask *create_MSG(
+	uint32_t nodeID,
+	uint16_t typeMSG,
+	uint16_t index,
+	uint8_t subindex,
+	uint32_t len,
+	uint8_t *data);
+gpointer free_MSG(CANOpenMSGTask *MSG);
+CANOpenMSGTask *CANOpenReceive(struct can_frame *CANframeReceived);
+void CANOpenTransmit(int sockDesc, CANOpenMSGTask *TransmitMSG);
 /////////////////////////////////////////////////////////////////////
 // Поток: выполнение фоновых задач
 gpointer backgroundTasksThread(gpointer data)
@@ -12,13 +29,13 @@ gpointer backgroundTasksThread(gpointer data)
 	gboolean treadRunning = TRUE;
 	do
 	{
-		InterThreadTaskStruct *task = g_async_queue_pop(Background.Queue);
+		TaskStruct *task = g_async_queue_pop(Background.Queue);
 		switch (task->CMD)
 		{
-		case TAST_PARSE_INTEL_HEX:
+		case TASK_PARSE_INTEL_HEX:
 		{
 			printf("TASK_PARSE_INTEL_HEX\n");
-			if (IntelHexParser("stm32g474ret6.hex", &extractedData))
+			if (IntelHexParser(firmware_file_name, &extractedData))
 			{
 				perror("IntelHexParser failed\n");
 				treadRunning = FALSE;
@@ -38,23 +55,31 @@ gpointer backgroundTasksThread(gpointer data)
 		case TASK_TRANSMIT_FIRMWARE:
 		{
 			printf("TASK_TRANSMIT_FIRMWARE\n");
-			uint8_t *buff = (uint8_t *)calloc(sizeof(extractedData.vectors_address), sizeof(uint8_t));
-			memcpy(buff, &extractedData.vectors_address, sizeof(extractedData.vectors_address));
-			g_async_queue_push(CANTx.Queue,
-							   create_task(TRANSMIT_TASK_SEND_VECTORS_ADDR,
-										   sizeof(extractedData.vectors_address),
-										   buff));
-			buff = (uint8_t *)realloc(buff, sizeof(extractedData.programm_address));
-			memcpy(buff, &extractedData.programm_address, sizeof(extractedData.programm_address));
-			g_async_queue_push(CANTx.Queue,
-							   create_task(TRANSMIT_TASK_SEND_PROGRAMM_ADDR,
-										   sizeof(extractedData.programm_address),
-										   buff));
-			user_free(buff);
-			g_async_queue_push(CANTx.Queue,
-							   create_task(TRANSMIT_TASK_SEND_PROGRAMM_DATA,
-										   extractedData.program_data_size,
-										   extractedData.program_data));
+			if (vectorsAddrTransmit(&extractedData) == EXIT_FAILURE)
+			{
+				printf("vectorsAddrTransmit failure\n");
+				user_free(extractedData.program_data);
+				break;
+			}
+			if (programAddrTransmit(&extractedData) == EXIT_FAILURE)
+			{
+				printf("programAddrTransmit failure\n");
+				user_free(extractedData.program_data);
+				break;
+			}
+			if (rebootCMDTransmit(&extractedData) == EXIT_FAILURE)
+			{
+				printf("rebootCMDTransmit failure\n");
+				user_free(extractedData.program_data);
+				break;
+			}
+			if (programTransmit(&extractedData) == EXIT_FAILURE)
+			{
+				printf("programTransmit failure\n");
+				user_free(extractedData.program_data);
+				break;
+			}
+			user_free(extractedData.program_data);
 		}
 		break;
 		case TASK_EXIT:
@@ -62,6 +87,7 @@ gpointer backgroundTasksThread(gpointer data)
 			printf("TASK_EXIT\n");
 			treadRunning = FALSE;
 		}
+		break;
 		default:
 		{
 		}
@@ -72,7 +98,68 @@ gpointer backgroundTasksThread(gpointer data)
 	user_free(extractedData.program_data);
 	return NULL;
 }
-
+/////////////////////////////////////////////////////////////////////
+// Поток: связь по CANOpen
+#define POLL_EVENT_TIMEOUT 1000
+gpointer CANOpenCommThread(gpointer data)
+{
+	gboolean treadRunning = TRUE;
+	struct can_frame CANframeReceived = {0};
+	int sockDesc = openSocketCAN("vcan0");
+	if (sockDesc < 0)
+	{
+		perror("openSocketCAN failed\n");
+		return NULL;
+	}
+	g_async_queue_push(CANOpenComm.Queue, create_task(COMM_TASK_WAIT_MESSAGE, 0, NULL));
+	do
+	{
+		TaskStruct *task = g_async_queue_pop(CANOpenComm.Queue);
+		switch (task->CMD)
+		{
+		case COMM_TASK_WAIT_MESSAGE:
+		{
+			if (socketCANReceiveNotBlocking(sockDesc, &CANframeReceived, POLL_EVENT_TIMEOUT) == SOCKET_CAN_NEW_MSG)
+			{
+				// Добавляем сообщение в очередь обработки
+				CANOpenMSGTask *ReceiveMSG = CANOpenReceive(&CANframeReceived);
+				if (ReceiveMSG != NULL)
+				{
+					g_async_queue_push(incomingQueue, ReceiveMSG);
+				}
+			}
+			g_async_queue_push(CANOpenComm.Queue, create_task(COMM_TASK_MSG_TRANSMIT, 0, NULL));
+		}
+		break;
+		case COMM_TASK_MSG_TRANSMIT:
+		{
+			CANOpenMSGTask *TransmitMSG = g_async_queue_try_pop(outgoingQueue);
+			if (TransmitMSG != NULL)
+			{
+				CANOpenTransmit(sockDesc, TransmitMSG);
+			}
+			free_MSG(TransmitMSG);
+			g_async_queue_push(CANOpenComm.Queue, create_task(COMM_TASK_WAIT_MESSAGE, 0, NULL));
+		}
+		break;
+		case COMM_TASK_EXIT:
+		{
+			printf("COMM_TASK_EXIT\n");
+			treadRunning = FALSE;
+		}
+		break;
+		default:
+		{
+		}
+		break;
+		}
+		free_task(task);
+	} while (treadRunning);
+	closeSocketCAN(sockDesc);
+	return NULL;
+}
+/////////////////////////////////////////////////////////////////////
+// Функция: Шифрование прошивки
 uint8_t key[16] = {0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c};
 gint encryptFirmware(ExtractedFirmwareStruct *extractedData)
 {
@@ -107,196 +194,305 @@ gint encryptFirmware(ExtractedFirmwareStruct *extractedData)
 	}
 	return EXIT_SUCCESS;
 }
-
-#define NODE_ID 2
-#define SDO_TX (0x600 + NODE_ID)
-#define SDO_RX (0x580 + NODE_ID)
-// typedef struct
-// {
-// 	uint8_t COBID
-// };
-
 /////////////////////////////////////////////////////////////////////
-// Поток: передает сообщения по CAN
-gpointer socketCANTransmitThread(gpointer data)
+// Функция:
+CANOpenMSGTask *create_MSG(
+	uint32_t nodeID,
+	uint16_t typeMSG,
+	uint16_t index,
+	uint8_t subindex,
+	uint32_t len,
+	uint8_t *data)
 {
-	int sockDesc = openSocketCAN("vcan0");
-	if (sockDesc < 0)
-	{
-		perror("openSocketCAN failed\n");
-		return NULL;
-	}
-	gboolean treadRunning = TRUE;
-	do
-	{
-		InterThreadTaskStruct *task = g_async_queue_pop(CANTx.Queue);
-		switch (task->CMD)
-		{
-		case TRANSMIT_TASK_WAIT:
-		{
-		}
-		break;
-		case TRANSMIT_TASK_SEND_VECTORS_ADDR:
-		{
-			printf("TRANSMIT_TASK_SEND_VECTORS_ADDR\n");
-			// Запрос:	600+NodeID  8байт   22  51  1F  02  Адрес начала таблицы векторов прерываний
-			// Ответ:	580+NodeID  4байта  60  51  1F  02
-			// SDORequest()
-		}
-		break;
-		case TRANSMIT_TASK_SEND_PROGRAMM_ADDR:
-		{
-			printf("TRANSMIT_TASK_SEND_PROGRAMM_ADDR\n");
-			// Запрос:	600+NodeID  8байт   22  51  1F  03  Адрес начала кода программы
-			// Ответ:	580+NodeID  4байта  60  51  1F  03
-		}
-		case TRANSMIT_TASK_REBOOT:
-		{
-			printf("TRANSMIT_TASK_REBOOT\n");
-			// Запрос:	600+NodeID  8байт   22  51  1F  01  Команда на перезагрузку
-			// Ответ:	580+NodeID  4байта  60  51  1F  01  // Отвечаем после перезагрузки
-		}
-		break;
-		case TRANSMIT_TASK_SEND_PROGRAMM_DATA:
-		{
-			// Запрос:	600+NodeID  8байт   21  50  1F  01  размер прошивки
-			// Ответ:	580+NodeID  4байта  60  50  1F  01
-			// Запрос:	600+NodeID  8байт   00  7байт прошивки
-			// Ответ:	580+NodeID  4байта  20
-			// Запрос:	600+NodeID  8байт   10  7байт прошивки
-			// Ответ:	580+NodeID  4байта  30
-			// Запрос:	600+NodeID  8байт   00  7байт прошивки
-			// Ответ:	580+NodeID  4байта  20
-			// ...
-			// Запрос:	600+NodeID  8байт   11  7байт прошивки
-			// Ответ:	580+NodeID  4байта  30
-			printf("TRANSMIT_TASK_SEND_PROGRAMM_DATA\n");
-			uint8_t CANDataBuff[8] = {0};
-			for (int i = 0; i < task->LEN; i += 7)
-			{
-				memcpy(&CANDataBuff[1], &task->data[i], 7);
-				CANDataBuff[0] = 0x00;
-				socketCANTransmit(sockDesc, 0x011, 8, CANDataBuff);
-				// // Морозим поток до получения подтверждения
-				// InterThreadTaskStruct *waitCANReceiveMSG = g_async_queue_pop(CANReceiveMSGQueue);
-				// switch (waitCANReceiveMSG->CMD)
-				// {
-				// case TASK_TRANSMIT_FIRMWARE_OK:
-				// {
-				// 	printf("TASK_TRANSMIT_FIRMWARE_OK\n");
-				// }
-				// break;
-				// default:
-				// 	break;
-				// }
-				// free_task(waitCANReceiveMSG);
-			}
-			// Отправляем SDO по адресу 0x600 + 0xID
-			// Активируем загрузчик записью в [1F51h,01h] = 0x01
-			// Переходим в состояние TRANSMIT_TASK_WAIT_CONFIRM
-			// Пишем очередной пакет данных программы в [1F50h,01h]
-			// Переходим в состояние TRANSMIT_TASK_WAIT_CONFIRM
-		}
-		break;
-		case TRANSMIT_TASK_EXIT:
-		{
-			printf("TRANSMIT_TASK_EXIT\n");
-			treadRunning = FALSE;
-		}
-		break;
-		default:
-		{
-		}
-		break;
-		}
-		free_task(task);
-	} while (treadRunning);
-
-	closeSocketCAN(sockDesc);
-	return NULL;
+	CANOpenMSGTask *MSG = g_new(CANOpenMSGTask, 1);
+	MSG->nodeID = nodeID;
+	MSG->typeMSG = typeMSG;
+	MSG->index = index;
+	MSG->subindex = subindex;
+	MSG->len = len;
+	MSG->data = (uint8_t *)g_memdup2(data, len);
+	return MSG;
 }
-#define POLL_EVENT_TIMEOUT 1000
 /////////////////////////////////////////////////////////////////////
-// Поток: принимает сообщения по CAN
-gpointer socketCANReceiveThread(gpointer data)
+// Функция:
+gpointer free_MSG(CANOpenMSGTask *MSG)
 {
-	gboolean treadRunning = TRUE;
-	struct can_frame CANframe = {0};
-	int sockDesc = openSocketCAN("vcan0");
-	if (sockDesc < 0)
+	if (MSG)
 	{
-		perror("openSocketCAN failed\n");
-		return NULL;
+		user_free(MSG->data);
+		user_free(MSG);
 	}
-
-	// Настройка структуры pollfd
-	struct pollfd sockfds[1];
-	sockfds[0].fd = sockDesc;	// Сокет для мониторинга
-	sockfds[0].events = POLLIN; // Интересующее событие: данные для чтения
-	int RetPoll = 0;
-	uint16_t CMD = RECEIVE_TASK_WAIT_MESSAGE;
-	do
+}
+/////////////////////////////////////////////////////////////////////
+// Функция:
+// Запрос:	600+NodeID  8байт   22  51  1F  02  Адрес начала таблицы векторов прерываний
+// Ответ:	580+NodeID  4байта  60  51  1F  02
+// cansend vcan0 582#60511F02
+int vectorsAddrTransmit(ExtractedFirmwareStruct *extractedData)
+{
+	uint32_t nodeID = SDO_TX;
+	uint16_t typeMSG = SDO_EXPEDITED_TRANSFER;
+	uint16_t index = 0x1F51;
+	uint8_t subindex = 0x02;
+	uint32_t len = 4;
+	uint8_t vectors_address[4] = {0};
+	for (int i = 0; i < 4; i++)
 	{
-		InterThreadTaskStruct *task = g_async_queue_try_pop(CANRx.Queue);
-		if (task != NULL)
+		vectors_address[i] = (uint8_t)((extractedData->vectors_address >> (i * 8)) & 0xFF);
+	}
+	g_async_queue_push(outgoingQueue, create_MSG(nodeID,
+												 typeMSG,
+												 index,
+												 subindex,
+												 len,
+												 vectors_address));
+	return waitingSDOResponse(SDO_RX);
+}
+/////////////////////////////////////////////////////////////////////
+// Функция:
+// Запрос:	600+NodeID  8байт   22  51  1F  03  Адрес начала кода программы
+// Ответ:	580+NodeID  4байта  60  51  1F  03
+// cansend vcan0 582#60511F03
+int programAddrTransmit(ExtractedFirmwareStruct *extractedData)
+{
+	uint32_t nodeID = SDO_TX;
+	uint16_t typeMSG = SDO_EXPEDITED_TRANSFER;
+	uint16_t index = 0x1F51;
+	uint8_t subindex = 0x03;
+	uint32_t len = 4;
+	uint8_t programm_address[4] = {0};
+	for (int i = 0; i < 4; i++)
+	{
+		programm_address[i] = (uint8_t)((extractedData->programm_address >> (i * 8)) & 0xFF);
+	}
+	g_async_queue_push(outgoingQueue, create_MSG(nodeID,
+												 typeMSG,
+												 index,
+												 subindex,
+												 len,
+												 programm_address));
+	return waitingSDOResponse(SDO_RX);
+}
+/////////////////////////////////////////////////////////////////////
+// Функция:
+// Запрос:	600+NodeID  8байт   22  51  1F  01  Команда на перезагрузку
+// Ответ:	580+NodeID  4байта  60  51  1F  01  // Отвечаем после перезагрузки
+// cansend vcan0 582#60511F01
+int rebootCMDTransmit()
+{
+	uint32_t nodeID = SDO_TX;
+	uint16_t typeMSG = SDO_EXPEDITED_TRANSFER;
+	uint16_t index = 0x1F51;
+	uint8_t subindex = 0x01;
+	uint32_t len = 1;
+	uint8_t rebootCMD = (uint8_t)REBOOT_CMD;
+	g_async_queue_push(outgoingQueue, create_MSG(nodeID,
+												 typeMSG,
+												 index,
+												 subindex,
+												 len,
+												 &rebootCMD));
+	return waitingSDOResponse(SDO_RX);
+}
+/////////////////////////////////////////////////////////////////////
+// Функция:
+// Запрос:	600+NodeID  8байт   00  7байт прошивки
+// Ответ:	580+NodeID  4байта  20
+// cansend vcan0 582#20
+// Запрос:	600+NodeID  8байт   10  7байт прошивки
+// Ответ:	580+NodeID  1байт  30
+// cansend vcan0 582#30
+// Запрос:	600+NodeID  8байт   00  7байт прошивки
+// Ответ:	580+NodeID  1байт  20
+// cansend vcan0 582#20
+// ...
+// Запрос:	600+NodeID  8байт   11  7байт прошивки
+// Ответ:	580+NodeID  1байт  30
+// cansend vcan0 582#30
+int programTransmit(ExtractedFirmwareStruct *extractedData)
+{
+	if (programSegmentTransmitInit(extractedData) == EXIT_FAILURE)
+	{
+		return EXIT_FAILURE;
+	}
+	uint8_t buff[7] = {0};
+	uint32_t remaining_data_size = 0;
+	uint32_t typeMSG = 0;
+	for (int i = 0; i < extractedData->program_data_size; i += 7)
+	{
+		remaining_data_size = extractedData->program_data_size - i;
+		uint32_t segment_size = (remaining_data_size >= 7) ? 7 : remaining_data_size;
+		memcpy(buff, extractedData->program_data + i, segment_size);
+		if (i + 7 > extractedData->program_data_size)
 		{
-			CMD = task->CMD;
+			typeMSG = (typeMSG == SDO_NORMAL_TRANSFER) ? SDO_NORMAL_TRANSFER_LAST_TG : SDO_NORMAL_TRANSFER_LAST;
 		}
-		switch (CMD)
+		else
 		{
-		case RECEIVE_TASK_WAIT:
-		{
+			typeMSG = (typeMSG == SDO_NORMAL_TRANSFER) ? SDO_NORMAL_TRANSFER_TG : SDO_NORMAL_TRANSFER;
 		}
-		break;
-		case RECEIVE_TASK_WAIT_MESSAGE:
+		if (programSegmentTransmit(buff, typeMSG, segment_size) == EXIT_FAILURE)
 		{
-			RetPoll = poll(sockfds, 1, POLL_EVENT_TIMEOUT);
-			if (RetPoll < 0)
+			return EXIT_FAILURE;
+		}
+	}
+	return EXIT_SUCCESS;
+}
+/////////////////////////////////////////////////////////////////////
+// Функция:
+// Запрос:	600+NodeID  8байт   21  50  1F  01  размер прошивки
+// Ответ:	580+NodeID  4байта  60  50  1F  01
+// cansend vcan0 582#60501F01
+int programSegmentTransmitInit(ExtractedFirmwareStruct *extractedData)
+{
+	uint32_t nodeID = SDO_TX;
+	uint16_t typeMSG = SDO_NORMAL_TRANSFER_INIT;
+	uint16_t index = 0x1F50;
+	uint8_t subindex = 0x01;
+	uint32_t len = 4;
+	uint8_t program_data_size[4] = {0};
+	for (int i = 0; i < 4; i++)
+	{
+		program_data_size[i] = (uint8_t)((extractedData->program_data_size >> (i * 8)) & 0xFF);
+	}
+	g_async_queue_push(outgoingQueue, create_MSG(nodeID,
+												 typeMSG,
+												 index,
+												 subindex,
+												 len,
+												 program_data_size));
+	return waitingSDOResponse(SDO_RX);
+}
+/////////////////////////////////////////////////////////////////////
+// Функция:
+int programSegmentTransmit(uint8_t *buff, uint16_t typeMSG, uint32_t buff_size)
+{
+	uint32_t nodeID = SDO_TX;
+	uint16_t index = 0;
+	uint8_t subindex = 0;
+	uint32_t len = buff_size;
+	g_async_queue_push(outgoingQueue, create_MSG(nodeID,
+												 typeMSG,
+												 index,
+												 subindex,
+												 len,
+												 buff));
+	return waitingSDOResponse(SDO_RX);
+}
+/////////////////////////////////////////////////////////////////////
+// Функция:
+int waitingSDOResponse(uint32_t nodeID)
+{
+	uint32_t waiting_count = WAITING_COUNT_START;
+	while (TRUE)
+	{
+		CANOpenMSGTask *MSG = g_async_queue_try_pop(incomingQueue);
+		if (MSG == NULL)
+		{
+			g_usleep(1000);
+			// waiting_count--;
+			continue;
+		}
+		if (MSG->nodeID == nodeID)
+		{
+			if (MSG->typeMSG == SDO_OK)
 			{
-				perror("poll");
+				free_MSG(MSG);
+				return EXIT_SUCCESS;
 			}
-			else if (RetPoll == 0)
+			else if (MSG->typeMSG == SDO_ABORT)
 			{
-			}
-			else
-			{
-				if (sockfds[0].revents & POLLIN)
-				{
-					sockfds[0].revents = 0;
-					if (socketCANReceive(sockDesc, &CANframe) == SOCKET_CAN_OK)
-					{
-						for (int i = 0; i < CANframe.len; i++)
-						{
-							printf("%02X ", CANframe.data[i]);
-						}
-						printf("\n");
-						// if (CANframe.can_id == 0x011)
-						// {
-						//     InterThreadTaskStruct *task = create_task(TASK_TRANSMIT_FIRMWARE_OK, 0, NULL);
-						//     g_async_queue_push(CANReceiveMSGQueue, task);
-						// }
-					}
-					else
-					{
-						perror("socketCANReceive failed");
-					}
-				}
+				free_MSG(MSG);
+				return EXIT_FAILURE;
 			}
 		}
+		g_async_queue_push(incomingQueue, MSG);
+
+		free_MSG(MSG);
+		g_usleep(1000);
+		// waiting_count--;
+	}
+	return EXIT_FAILURE;
+}
+/////////////////////////////////////////////////////////////////////
+// Функция:
+CANOpenMSGTask *CANOpenReceive(struct can_frame *CANframeReceived)
+{
+	uint32_t nodeID = CANframeReceived->can_id;
+	uint32_t typeMSG;
+	uint16_t index = 0;
+	uint8_t subindex = 0;
+	if (CANframeReceived->data[0] != 0x80)
+	{
+		typeMSG = SDO_OK;
+	}
+	else
+	{
+		typeMSG = SDO_ABORT;
+	}
+	uint32_t len = CANframeReceived->len;
+	uint8_t *data = (uint8_t *)calloc(sizeof(uint8_t), len);
+	memcpy(data, CANframeReceived->data, len);
+	CANOpenMSGTask *MSG = create_MSG(nodeID, typeMSG, index, subindex, len, data);
+	user_free(data);
+	return MSG;
+}
+/////////////////////////////////////////////////////////////////////
+// Функция:
+void CANOpenTransmit(int sockDesc, CANOpenMSGTask *TransmitMSG)
+{
+	uint8_t data[8] = {0};
+	uint8_t MSGLen = 8;
+
+	switch (TransmitMSG->typeMSG)
+	{
+	case SDO_EXPEDITED_TRANSFER:
+	{
+		data[0] = SDO_EXPEDITED_TRANSFER_SRB_REQ;
+		data[1] = (uint8_t)(TransmitMSG->index & 0xFF);
+		data[2] = (uint8_t)((TransmitMSG->index >> 8) & 0xFF);
+		data[3] = TransmitMSG->subindex;
+		memcpy(data + 4, TransmitMSG->data, TransmitMSG->len);
+	}
+	break;
+	case SDO_NORMAL_TRANSFER_INIT:
+	{
+		data[0] = SDO_NORMAL_TRANSFER_INIT_SRB_REQ;
+		data[1] = (uint8_t)(TransmitMSG->index & 0xFF);
+		data[2] = (uint8_t)((TransmitMSG->index >> 8) & 0xFF);
+		data[3] = TransmitMSG->subindex;
+		memcpy(data + 4, TransmitMSG->data, TransmitMSG->len);
+	}
+	break;
+	case SDO_NORMAL_TRANSFER:
+	{
+		data[0] = SDO_NORMAL_TRANSFER_SRB_REQ;
+		memcpy(data + 1, TransmitMSG->data, TransmitMSG->len);
+	}
+	break;
+	case SDO_NORMAL_TRANSFER_TG:
+	{
+		data[0] = SDO_NORMAL_TRANSFER_SRB_REQ_TG;
+		memcpy(data + 1, TransmitMSG->data, TransmitMSG->len);
+	}
+	break;
+	case SDO_NORMAL_TRANSFER_LAST:
+	{
+		data[0] = SDO_NORMAL_TRANSFER_SRB_REQ_LAST;
+		memcpy(data + 1, TransmitMSG->data, TransmitMSG->len);
+	}
+	break;
+	case SDO_NORMAL_TRANSFER_LAST_TG:
+	{
+		data[0] = SDO_NORMAL_TRANSFER_SRB_REQ_LAST_TG;
+		memcpy(data + 1, TransmitMSG->data, TransmitMSG->len);
+	}
+	break;
+	default:
 		break;
-		case RECEIVE_TASK_EXIT:
-		{
-			printf("RECEIVE_TASK_EXIT\n");
-			treadRunning = FALSE;
-		}
-		break;
-		default:
-		{
-		}
-		break;
-		}
-		free_task(task);
-	} while (treadRunning);
-	closeSocketCAN(sockDesc);
-	return NULL;
+	}
+	socketCANTransmit(sockDesc,
+					  TransmitMSG->nodeID,
+					  MSGLen,
+					  data);
 }
